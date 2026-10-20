@@ -218,6 +218,20 @@ input[type=color]{width:44px;height:36px;border:1px solid var(--line);border-rad
           </div>
         </div>
       </div>
+      <div id="smartBox" class="field">
+        <label class="switch"><input id="smart" type="checkbox" checked> Резать в паузах, а не на полуслове</label>
+        <p id="smartHint" class="hint">Разрез сдвигается к ближайшей паузе в речи, до 4 с раньше; часть никогда не получается длиннее выбранной длины. Если субтитры распознаны, учитываются границы слов и предложений.</p>
+      </div>
+      <div class="field">
+        <label class="lbl">Нахлёст между частями</label>
+        <div class="chips" id="ovl">
+          <button class="chip" data-o="0">нет</button>
+          <button class="chip" data-o="1">1 с</button>
+          <button class="chip" data-o="2" aria-pressed="true">2 с</button>
+          <button class="chip" data-o="3">3 с</button>
+        </div>
+        <p class="hint">Конец каждой части повторяется в начале следующей. Нахлёст входит в длину части.</p>
+      </div>
       <div id="cutsBox" class="field" hidden>
         <p class="hint">Поставьте видео на нужный момент и нажмите «Разрез здесь», или введите время вручную (например 1:25 или 85).</p>
         <div class="row">
@@ -326,6 +340,13 @@ input[type=color]{width:44px;height:36px;border:1px solid var(--line);border-rad
     <div id="results" class="results"></div>
   </section>
 
+  <section class="panel" aria-label="Проверка">
+    <div class="row between"><h2>Проверка</h2><span class="lbl mono" id="ver"></span></div>
+    <p class="hint">Если что-то не работает, нажмите кнопку и пришлите скриншот результата.</p>
+    <button id="diagGo" class="btn">Проверить связь и видео</button>
+    <div id="diagOut" class="list"></div>
+  </section>
+
   <section class="panel" aria-label="Память">
     <div class="row between"><h2>Память на устройстве</h2><button id="memRe" class="btn sm">Обновить</button></div>
     <div id="memInfo" class="list"></div>
@@ -343,7 +364,7 @@ const $ = s => document.querySelector(s);
 const vid = $('#vid'), work = $('#work');
 const inClaude = !!window.claude;
 const st = { file:null, url:null, dur:0, vw:0, vh:0, fmt:'orig', pos:.5, mode:'equal', len:60, cuts:[], off:new Set(), results:[], busy:false, abort:false,
-  caps:[], subOn:true, tpl:'hormozi', fill:'#ffffff', accent:'#ffe11a', subY:.72, subSize:1, maxWords:3, noPunct:false, hist:[] };
+  caps:[], smart:true, overlap:2, env:null, envMed:1, envPromise:null, subOn:true, tpl:'hormozi', fill:'#ffffff', accent:'#ffe11a', subY:.72, subSize:1, maxWords:3, noPunct:false, hist:[] };
 
 function fmtT(t, dec=true){ t=Math.max(0,t); const m=Math.floor(t/60), s=t-m*60; return m+':'+(dec? s.toFixed(1).padStart(4,'0') : String(Math.floor(s)).padStart(2,'0')); }
 function fmtT2(t){ t=Math.max(0,t); const m=Math.floor(t/60), s=t-m*60; return m+':'+s.toFixed(2).padStart(5,'0'); }
@@ -763,6 +784,7 @@ $('#asrGo').onclick=async()=>{
   try{
     asrUI(1,'Извлекаю звук из видео…');
     const audio=await decodeAudio(st.file);
+    if(!st.env) envFrom(audio);
     asrUI(3,'Загружаю библиотеку распознавания…'); stage='load'; lastBeat=Date.now();
     try{ await wCall({type:'load',model:M.id,device,dtype}); }
     catch(e){ if(device==='webgpu' && !M.gpu){ device='wasm'; dtype='q8'; await wCall({type:'load',model:M.id,device,dtype}); } else throw e; }
@@ -784,7 +806,7 @@ $('#asrGo').onclick=async()=>{
       asrUI(100,'Готово: '+words.length+' '+plural(words.length,['слово','слова','слов'])+'. Проверьте текст в редакторе справа.'+(wordLevel?'':' Тайминг слов приблизительный — поправьте границы фраз, если нужно.'));
     }
   }catch(e){
-    console.error(e);
+    console.error(e); logErr('Распознавание: '+(e.message||e));
     asrUI(0,'Не получилось: '+(e.message||e)+'. Проверьте интернет (модель скачивается при первом запуске) или выберите «Быструю» модель.');
   }
   clearInterval(dog); memRefresh();
@@ -804,7 +826,7 @@ $('#replace').onclick=()=>{ if(!st.busy) fileIn.click(); };
 function load(f){
   if(!f.type.startsWith('video/') && !/\.(mp4|mov|webm|m4v|mkv)$/i.test(f.name)){ toast('Это не видеофайл. Выберите MP4, MOV или WebM.'); return; }
   if(st.url) URL.revokeObjectURL(st.url);
-  st.file=f; st.url=URL.createObjectURL(f); st.cuts=[]; st.off.clear(); st.caps=[]; st.hist=[]; $('#undo').disabled=true;
+  st.file=f; st.url=URL.createObjectURL(f); st.env=null; st.envPromise=null; st.cuts=[]; st.off.clear(); st.caps=[]; st.hist=[]; $('#undo').disabled=true;
   vid.src=st.url; work.src=st.url;
   vid.onloadedmetadata=()=>{
     st.dur=vid.duration; st.vw=vid.videoWidth; st.vh=vid.videoHeight;
@@ -813,6 +835,7 @@ function load(f){
     $('#total').textContent=fmtT(st.dur); $('#tend').textContent=fmtT(st.dur,false); $('#tmid').textContent=fmtT(st.dur/2,false);
     sizeFrame(); vid.currentTime=0.01;
     if(loadLocal()) toast('Восстановлены субтитры для этого видео');
+    if(st.smart) setTimeout(analyzeAudio,400);
     $('#asrGo').disabled=inClaude;
     refresh(); renderEditor();
   };
@@ -874,9 +897,11 @@ function segCtl(id,key,after){
   });
 }
 segCtl('#fmt','fmt',()=>{ st.pos=.5; $('#pos').value=50; });
-segCtl('#mode','mode',()=>{ $('#equalBox').hidden=st.mode!=='equal'; $('#cutsBox').hidden=st.mode!=='cuts'; st.off.clear(); });
+segCtl('#mode','mode',()=>{ $('#equalBox').hidden=st.mode!=='equal'; $('#cutsBox').hidden=st.mode!=='cuts'; $('#smartBox').hidden=st.mode!=='equal'; st.off.clear(); });
 
 /* ================= segments ================= */
+$('#smart').onchange=e=>{ st.smart=e.target.checked; if(st.smart) analyzeAudio(); refresh(); };
+$('#ovl').querySelectorAll('.chip').forEach(c=>c.onclick=()=>{ st.overlap=+c.dataset.o; $('#ovl').querySelectorAll('.chip').forEach(x=>x.setAttribute('aria-pressed',x===c)); refresh(); });
 $('#len').oninput=e=>{ const v=parseFloat(e.target.value); if(v>0){ st.len=v; st.off.clear(); syncChips(); refresh(); } };
 $('#presets').querySelectorAll('.chip').forEach(c=>c.onclick=()=>{ st.len=+c.dataset.s; $('#len').value=st.len; st.off.clear(); syncChips(); refresh(); });
 function syncChips(){ $('#presets').querySelectorAll('.chip').forEach(c=>c.setAttribute('aria-pressed', +c.dataset.s===st.len)); }
@@ -889,17 +914,64 @@ function addCut(t){
 $('#cutHere').onclick=()=>addCut(vid.currentTime);
 $('#cutAdd').onclick=()=>{ const t=parseT($('#cutIn').value); if(isNaN(t)){ toast('Введите время как 1:25 или 85.'); return; } addCut(t); $('#cutIn').value=''; };
 $('#cutIn').onkeydown=e=>{ if(e.key==='Enter') $('#cutAdd').click(); };
+/* ---- smart cuts: find pauses in the sound so a cut never lands mid-word ---- */
+const ENV_STEP=0.05;
+function envFrom(a){
+  const fr=Math.round(16000*ENV_STEP), n=Math.floor(a.length/fr), env=new Float32Array(n);
+  for(let i=0;i<n;i++){ let s=0; for(let j=i*fr;j<(i+1)*fr;j++) s+=a[j]*a[j]; env[i]=Math.sqrt(s/fr); }
+  const sorted=Array.from(env).sort((x,y)=>x-y);
+  st.env=env; st.envMed=Math.max(1e-5, sorted[Math.floor(n*0.6)]||1e-5);
+}
+function analyzeAudio(){
+  if(!st.file||st.env) return Promise.resolve();
+  if(st.envPromise) return st.envPromise;
+  const f=st.file; $('#smartHint').textContent='Ищу паузы в речи…';
+  st.envPromise=decodeAudio(f).then(a=>{ if(st.file!==f) return; envFrom(a);
+      $('#smartHint').textContent='Паузы найдены: разрезы сдвинуты к ближайшей паузе (до 4 с раньше).'; })
+    .catch(e=>{ logErr('Анализ звука: '+(e.message||e)); $('#smartHint').textContent='Не удалось разобрать звук этого видео, режу точно по времени.'; })
+    .finally(()=>{ st.envPromise=null; refresh(); });
+  return st.envPromise;
+}
+function energyAt(t){ const e=st.env; if(!e) return 1; const i=Math.round(t/ENV_STEP); let s=0,c=0;
+  for(let k=i-3;k<=i+3;k++) if(k>=0&&k<e.length){ s+=e[k]; c++; } return c? s/c/st.envMed : 1; }
+function wordAt(ws,t){ let lo=0,hi=ws.length-1,i=-1; while(lo<=hi){ const m=(lo+hi)>>1; if(ws[m].t0<=t){ i=m; lo=m+1; } else hi=m-1; } return i<0?null:ws[i]; }
+// best cut point inside [lo, hi]; pauses and word gaps win, later points (closer to the target) slightly preferred
+function snap(lo,hi,ws){
+  if(!st.smart || (!st.env && !ws)) return hi;
+  let best=hi, bestC=Infinity;
+  for(let t=hi;t>=lo-1e-6;t-=ENV_STEP){
+    let c=energyAt(t)+0.12*(hi-t);
+    if(ws){ const w=wordAt(ws,t); if(w && t<w.t1+0.03) c+=4; else if(w && /[.!?…]$/.test(w.w)) c-=0.6; else if(w && /[,;:]$/.test(w.w)) c-=0.25; }
+    if(c<bestC){ bestC=c; best=t; }
+  }
+  return best;
+}
 function segments(){
-  if(!st.dur) return []; const out=[];
-  if(st.mode==='equal'){ const L=Math.max(1,st.len);
-    for(let t=0;t<st.dur-0.05;t+=L){ const e=Math.min(t+L,st.dur); if(e-t<0.5 && out.length) out[out.length-1].end=e; else out.push({start:t,end:e}); } }
-  else { const pts=[0,...st.cuts,st.dur]; for(let i=0;i<pts.length-1;i++) out.push({start:pts[i],end:pts[i+1]}); }
+  if(!st.dur) return [];
+  const ov=st.overlap, out=[];
+  if(st.mode==='equal'){
+    // each part, overlap included, is never longer than the chosen length (Reels limits)
+    const L=Math.max(1,st.len), ws=st.caps.length?flatWords():null; let start=0;
+    while(true){
+      const target=start+L;
+      if(target>=st.dur-0.5){ out.push({start,end:st.dur}); break; }
+      const lo=Math.max(start+ov+Math.min(2,L*0.5), target-4);
+      const cut=snap(lo,target,ws);
+      out.push({start,end:cut});
+      start=Math.max(0,cut-ov);
+      if(out.length>2000) break;
+    }
+  } else {
+    const pts=[0,...st.cuts,st.dur];
+    for(let i=0;i<pts.length-1;i++) out.push({start: i? Math.max(0,pts[i]-ov) : 0, end: pts[i+1]});
+  }
   return out;
 }
 function refreshTimeline(){
   if(!st.dur) return;
   const segs=segments(), tl=$('#tl'); tl.innerHTML='';
   segs.forEach((s,i)=>{ const d=document.createElement('div'); d.className='seg '+(i%2?'b':'a')+(st.off.has(i)?' off':'');
+    if(st.overlap>0){ d.style.top=(i%2?22:4)+'px'; d.style.bottom='auto'; d.style.height='16px'; }
     d.style.left=(s.start/st.dur*100)+'%'; d.style.width='calc('+((s.end-s.start)/st.dur*100)+'% - 2px)'; d.textContent=i+1; tl.appendChild(d); });
   st.caps.forEach(c=>{ const d=document.createElement('div'); d.className='capbar'; d.style.left=(c.start/st.dur*100)+'%'; d.style.width=Math.max(.2,(c.end-c.start)/st.dur*100)+'%'; tl.appendChild(d); });
   if(st.mode==='cuts') st.cuts.forEach(c=>{ const m=document.createElement('div'); m.className='cutmark'; m.style.left=(c/st.dur*100)+'%'; tl.appendChild(m); });
@@ -944,9 +1016,18 @@ function seekTo(t){
   if(!st.dur) return;
   t=clamp(t,0,Math.max(0,st.dur-0.05)); stopAt=null;
   seekWant=t; $('#cur').textContent=fmtT(t); const p=$('#ph'); if(p) p.style.left=(t/st.dur*100)+'%';
-  if(!vid.seeking) applySeek();
+  if(!vid.seeking || Date.now()-seekAt>1500) applySeek();
 }
-function applySeek(){ if(seekWant==null) return; const t=seekWant; seekWant=null; try{ vid.currentTime=t; }catch(e){} }
+let seekAt=0, seekWarned=false;
+function applySeek(){
+  if(seekWant==null) return; const t=seekWant; seekWant=null; seekAt=Date.now();
+  try{ vid.currentTime=t; }catch(e){ logErr('Перемотка: '+e.message); }
+  setTimeout(()=>{ // the video didn't move: most likely the file has no seek index
+    if(Math.abs(vid.currentTime-t)>2 && seekWant==null && !seekWarned){ seekWarned=true;
+      logErr('Перемотка не сработала: просили '+fmtT(t)+', видео на '+fmtT(vid.currentTime));
+      toast('Это видео не перематывается. Откройте раздел «Проверка» внизу — там причина и как исправить.'); }
+  },2500);
+}
 vid.addEventListener('seeked',()=>{ if(seekWant!=null) applySeek(); });
 (function scrub(){
   const tl=$('#tl'); let down=false;
@@ -972,7 +1053,8 @@ function setupAudio(){
 }
 const once=(el,ev)=>new Promise(r=>el.addEventListener(ev,r,{once:true}));
 async function renderSeg(seg, canvas, ctx, crop, mime, onTick){
-  work.pause(); work.currentTime=seg.start; await once(work,'seeked');
+  work.pause(); work.currentTime=seg.start;
+  await Promise.race([once(work,'seeked'), new Promise((_,rej)=>setTimeout(()=>rej(new Error('видео не перематывается к '+fmtT(seg.start,false))),10000))]);
   const paint=(t)=>{ ctx.drawImage(work,crop.sx,crop.sy,crop.sw,crop.sh,0,0,canvas.width,canvas.height); if(st.subOn&&st.caps.length) renderSubs(ctx,canvas.width,canvas.height,t); };
   paint(seg.start);
   const vs=canvas.captureStream(30); const tracks=[...vs.getVideoTracks()];
@@ -1000,6 +1082,7 @@ async function renderSeg(seg, canvas, ctx, crop, mime, onTick){
 $('#go').onclick=async()=>{
   if(st.busy) return;
   if(typeof MediaRecorder==='undefined' || !HTMLCanvasElement.prototype.captureStream){ toast('Этот браузер не умеет записывать видео. Откройте страницу в Chrome или Safari.'); return; }
+  if(st.smart && st.mode==='equal' && !st.env){ $('#go').textContent='Ищу паузы…'; await analyzeAudio(); }
   const all=segments(), todo=all.map((s,i)=>({...s,i})).filter(s=>!st.off.has(s.i)); if(!todo.length) return;
   vid.pause(); st.busy=true; st.abort=false; refresh(); $('#progBox').hidden=false; setUI(true);
   if(st.subOn&&st.caps.length){ try{ await document.fonts.load(fontStr(TPL[st.tpl],40),'АаBb'); }catch(e){} }
@@ -1020,7 +1103,7 @@ $('#go').onclick=async()=>{
     }
     $('#status').textContent= st.abort ? 'Остановлено.' : 'Готово: '+todo.length+' '+plural(todo.length,['отрезок','отрезка','отрезков'])+'.';
     if(!st.abort){ $('#bar').style.width='100%'; toast('Нарезка завершена'); }
-  }catch(e){ console.error(e); $('#status').textContent='Ошибка записи: '+(e.message||e)+'. Попробуйте формат «Как есть» или другой браузер.'; }
+  }catch(e){ console.error(e); logErr('Нарезка: '+(e.message||e)); $('#status').textContent='Ошибка записи: '+(e.message||e)+'. Попробуйте формат «Как есть» или другой браузер.'; }
   st.busy=false; setUI(false); refresh();
 };
 $('#stop').onclick=()=>{ st.abort=true; };
@@ -1100,11 +1183,57 @@ twoTap($('#clrModel'),async()=>{
 });
 $('#memRe').onclick=memRefresh;
 
+/* ================= diagnostics ================= */
+const APP_VERSION='7 · 20.10.2026';
+const errLog=[];
+function logErr(m){ errLog.push(new Date().toTimeString().slice(0,8)+' '+m); if(errLog.length>8) errLog.shift(); }
+addEventListener('error',e=>logErr('Ошибка: '+(e.message||e.type)));
+addEventListener('unhandledrejection',e=>logErr('Ошибка: '+((e.reason&&e.reason.message)||e.reason)));
+async function ping(url,ms=12000){
+  const t0=performance.now(); const ac=new AbortController(); const tm=setTimeout(()=>ac.abort(),ms);
+  try{ const r=await fetch(url,{cache:'no-store',signal:ac.signal}); clearTimeout(tm); return r.ok?{ok:true,ms:Math.round(performance.now()-t0)}:{ok:false,msg:'ответ '+r.status}; }
+  catch(e){ clearTimeout(tm); return {ok:false,msg: e.name==='AbortError'?'нет ответа за '+ms/1000+' с':'не открывается'}; }
+}
+$('#diagGo').onclick=async()=>{
+  const out=$('#diagOut'), b=$('#diagGo'); b.disabled=true; b.textContent='Проверяю…'; out.innerHTML='';
+  const row=(ok,a,c)=>{ const d=document.createElement('div'); d.className='item'; d.style.gridTemplateColumns='auto minmax(0,1fr)';
+    d.innerHTML='<span>'+(ok===true?'✅':ok===false?'❌':'ℹ️')+'</span><span></span>'; d.lastChild.textContent=a+(c?' — '+c:''); out.appendChild(d); };
+  row(null,'Версия приложения',APP_VERSION);
+  row(null,'Устройство',(navigator.userAgent.match(/(iPhone|iPad|Android)[^;)]*/)||['компьютер'])[0]+(matchMedia('(display-mode: standalone)').matches||navigator.standalone?', с экрана «Домой»':', в браузере'));
+  // video
+  if(!st.file) row(null,'Видео','не загружено — загрузите видео и проверьте ещё раз');
+  else{
+    row(null,'Файл',st.file.name+' · '+(st.file.type||'тип неизвестен')+' · '+mb(st.file.size)+' · '+st.vw+'×'+st.vh+' · '+fmtT(st.dur,false));
+    const sk=vid.seekable; let rng=[]; for(let i=0;i<sk.length;i++) rng.push(fmtT(sk.start(i),false)+'–'+fmtT(sk.end(i),false));
+    const full=sk.length && sk.end(sk.length-1)>=st.dur-1;
+    row(full,'Видео разрешает перематывать', rng.length? rng.join(', ') : 'нигде');
+    const was=vid.currentTime, wasPaused=vid.paused, target=Math.min(st.dur*0.5, Math.max(0,st.dur-1));
+    vid.pause();
+    const moved=await new Promise(res=>{ let done=false; const fin=v=>{ if(!done){ done=true; res(v); } };
+      vid.addEventListener('seeked',()=>fin(Math.abs(vid.currentTime-target)<2),{once:true});
+      setTimeout(()=>fin(false),5000); try{ vid.currentTime=target; }catch(e){ fin(false); } });
+    row(moved,'Тест перемотки на '+fmtT(target,false), moved?'работает':'видео осталось на '+fmtT(vid.currentTime,false));
+    try{ vid.currentTime=was; }catch(e){} if(!wasPaused) vid.play().catch(()=>{});
+    if(!moved||!full) row(false,'Как исправить','этот файл без «оглавления» для перемотки (так часто бывает у видео, скачанных с сайтов). Откройте его в «Фото» → «Править» → чуть обрежьте начало → «Готово» → «Сохранить как новое видео» и загрузите новый файл.');
+  }
+  // network for speech recognition
+  const lib=await ping('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1/package.json');
+  row(lib.ok,'Сервер библиотеки распознавания (jsDelivr)', lib.ok?'доступен, '+lib.ms+' мс':lib.msg);
+  const hf=await ping('https://huggingface.co/Xenova/whisper-base/resolve/main/config.json');
+  row(hf.ok,'Сервер модели (Hugging Face)', hf.ok?'доступен, '+hf.ms+' мс':hf.msg);
+  if(!lib.ok||!hf.ok) row(false,'Распознавание','без доступа к этим серверам модель не скачать. Включите VPN на первый запуск распознавания.');
+  let cached=0; for(const n of await modelCaches()){ try{ cached+=(await (await caches.open(n)).keys()).length; }catch(e){} }
+  row(cached>0?true:null,'Скачанные файлы модели', cached? cached+' шт.' : 'пока нет');
+  row(typeof Worker!=='undefined',"Фоновые вычисления (Worker)", typeof Worker!=='undefined'?'есть':'нет');
+  if(errLog.length) errLog.forEach(e=>row(false,'Журнал',e)); else row(true,'Журнал ошибок','пусто');
+  b.disabled=false; b.textContent='Проверить связь и видео';
+};
+
 /* ================= init ================= */
 if(inClaude){ $('#asrBox').hidden=true; $('#asrBlocked').hidden=false; }
 // phones have less memory: start with the light model
 if(/Android|iPhone|iPad|Mobile/i.test(navigator.userAgent)) $('#model').value='base';
-buildTiles(); renderEditor(); memRefresh();
+buildTiles(); renderEditor(); memRefresh(); $('#ver').textContent='версия '+APP_VERSION;
 document.fonts.ready.then(()=>{ requestAnimationFrame(drawTiles); });
 Object.values(TPL).forEach(T=>{ try{ document.fonts.load(fontStr(T,40),'АаBb'); }catch(e){} });
 document.fonts.addEventListener && document.fonts.addEventListener('loadingdone',()=>{ if(reduceMotion) drawTiles(0); drawOverlay(); });
