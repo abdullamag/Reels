@@ -133,6 +133,7 @@ input[type=color]{width:44px;height:36px;border:1px solid var(--line);border-rad
 .cap .acts button{border:0;background:transparent;color:var(--muted);font-size:12px;padding:4px 6px;border-radius:5px;cursor:pointer;min-height:28px}
 .cap .acts button:hover{color:var(--ink);background:var(--surface)}
 .cap .n{font:600 11px var(--f-mono);color:var(--muted);min-width:26px}
+.asrlog{margin:0;padding:8px 10px 8px 26px;background:var(--sunk);border-radius:8px;font:12px/1.5 var(--f-mono);color:var(--muted);max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-word}
 .empty{padding:22px;text-align:center;border:1px dashed var(--line);border-radius:8px;color:var(--muted);font-size:14px}
 
 .results{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}
@@ -283,6 +284,7 @@ input[type=color]{width:44px;height:36px;border:1px solid var(--line);border-rad
             <div id="asrProg" class="field" hidden>
               <div class="prog"><i id="asrBar"></i></div>
               <p id="asrStatus" class="status"></p>
+              <ol id="asrLog" class="asrlog" hidden></ol>
             </div>
             <p class="hint">Модель скачивается один раз и запоминается браузером. Распознавание идёт на вашем устройстве; на компьютере оно быстрее, чем на телефоне.</p>
           </div>
@@ -667,47 +669,81 @@ const MODELS={
   turbo:{id:'onnx-community/whisper-large-v3-turbo', label:'максимальная', gpu:true},
 };
 const HALLU=/(субтитры (сделал|создавал|делал|подогнал)[^.!?]*|продолжение следует\.*|редактор субтитров[^.!?]*|корректор[^.!?]*|спасибо за просмотр\.*|подписывайтесь на канал\.*|DimaTorzok|amara\.org[^.!?]*)/gi;
-const WORKER_SRC=`
-import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1';
-self.postMessage({ type: 'lib' });
-env.allowLocalModels = false;
-try { await caches.open('reels-probe'); } catch (e) { env.useBrowserCache = false; }
-let asr = null, key = '', wordOK = true;
-self.onmessage = async (e) => {
-  const m = e.data;
-  try {
-    if (m.type === 'load') {
-      if (key !== m.model + m.device) {
-        asr = await pipeline('automatic-speech-recognition', m.model, { device: m.device, dtype: m.dtype, progress_callback: p => self.postMessage({ type: 'dl', p }) });
-        key = m.model + m.device; wordOK = true;
-      }
-      self.postMessage({ type: 'ready' });
-    } else if (m.type === 'run') {
-      const opts = { task: 'transcribe' };
-      if (m.lang && m.lang !== 'auto') opts.language = m.lang;
-      let out = null, word = false;
-      if (wordOK) { try { out = await asr(m.audio, { ...opts, return_timestamps: 'word' }); word = true; } catch (err) { wordOK = false; } }
-      if (!out) out = await asr(m.audio, { ...opts, return_timestamps: true });
-      self.postMessage({ type: 'res', id: m.id, word, text: out.text, chunks: out.chunks || [] });
-    }
-  } catch (err) { self.postMessage({ type: 'err', msg: String((err && err.message) || err) }); }
-};`;
-let worker=null, wPending=null;
-function getWorker(){
-  if(worker) return worker;
-  worker=new Worker(URL.createObjectURL(new Blob([WORKER_SRC],{type:'text/javascript'})),{type:'module'});
-  worker.onmessage=e=>{ const m=e.data; lastBeat=Date.now();
-    if(m.type==='lib'){ asrUI(4,'Библиотека загружена, подключаюсь к серверу модели…'); return; }
-    if(m.type==='dl'){ const p=m.p; if(p.status==='initiate'&&!Object.keys(dlFiles).length) asrUI(5,'Начинаю скачивание модели…');
-      if(p.status==='progress' && p.total){ dlFiles[p.file]={l:p.loaded,t:p.total}; const tot=Object.values(dlFiles).reduce((a,f)=>a+f.t,0), got=Object.values(dlFiles).reduce((a,f)=>a+f.l,0);
-      asrUI(got/tot*100*.3,'Скачиваю модель: '+(got/1048576).toFixed(0)+' из '+(tot/1048576).toFixed(0)+' МБ'); } return; }
-    if(wPending){ const r=wPending; wPending=null; m.type==='err'? r.rej(new Error(m.msg)) : r.res(m); }
-  };
-  worker.onerror=e=>{ if(wPending){ const r=wPending; wPending=null; r.rej(new Error(e.message||'Не удалось запустить распознавание')); } worker=null; };
-  return worker;
+const ENGINE_CORE=String.raw`const LIB='https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1';
+let T=null, asr=null, key='', wordOK=true;
+async function lib(post){
+  if(T) return T;
+  post({type:'step',msg:'скачиваю библиотеку распознавания (jsDelivr)'});
+  try{ T=await import(LIB); }catch(err){ throw new Error('библиотека не загрузилась: '+((err&&err.message)||err)); }
+  T.env.allowLocalModels=false;
+  try{ await caches.open('reels-probe'); }catch(e){ T.env.useBrowserCache=false; post({type:'step',msg:'хранилище недоступно: модель не сохранится'}); }
+  post({type:'step',msg:'библиотека загружена'});
+  return T;
 }
-let dlFiles={}, lastBeat=0;
-function wCall(msg,transfer){ return new Promise((res,rej)=>{ wPending={res,rej}; getWorker().postMessage(msg,transfer||[]); }); }
+async function handle(m,post){
+  try{
+    if(m.type==='load'){
+      const L=await lib(post);
+      if(key!==m.model+m.device){
+        post({type:'step',msg:'запускаю модель '+m.model+' ('+m.device+')'});
+        asr=await L.pipeline('automatic-speech-recognition',m.model,{device:m.device,dtype:m.dtype,
+          progress_callback:p=>post({type:'dl',p:{status:p.status,file:p.file,loaded:p.loaded,total:p.total}})});
+        key=m.model+m.device; wordOK=true;
+      }
+      post({type:'ready'});
+    } else if(m.type==='run'){
+      const opts={task:'transcribe'};
+      if(m.lang&&m.lang!=='auto') opts.language=m.lang;
+      let out=null, word=false;
+      if(wordOK){ try{ out=await asr(m.audio,{...opts,return_timestamps:'word'}); word=true; }catch(err){ wordOK=false; post({type:'step',msg:'тайминг по словам недоступен: '+((err&&err.message)||err)}); } }
+      if(!out) out=await asr(m.audio,{...opts,return_timestamps:true});
+      post({type:'res',id:m.id,word,text:out.text,chunks:out.chunks||[]});
+    }
+  }catch(err){ post({type:'err',msg:String((err&&err.message)||err)}); }
+}
+`;
+const WORKER_SRC=ENGINE_CORE+"\nself.onmessage=e=>handle(e.data,x=>self.postMessage(x));\nself.postMessage({type:'step',msg:'фоновый поток запущен'});\n";
+let worker=null, wPending=null, engine=null, dlFiles={}, dlSeen={}, lastBeat=0, lastStep='', asrT0=0;
+function asrLog(msg){
+  lastStep=msg; const li=document.createElement('li');
+  li.textContent=((Date.now()-asrT0)/1000).toFixed(1).padStart(5,' ')+' с · '+msg; $('#asrLog').appendChild(li); $('#asrLog').hidden=false;
+}
+function onEngineMsg(m){
+  lastBeat=Date.now();
+  if(m.type==='step'){ asrLog(m.msg); return; }
+  if(m.type==='dl'){ const p=m.p, f=(p.file||'').split('/').pop();
+    if(p.status==='initiate' && !dlSeen[f]){ dlSeen[f]=1; asrLog('файл модели: '+f); }
+    if(p.status==='done' && dlSeen[f]!==2){ dlSeen[f]=2; asrLog('готово: '+f); }
+    if(p.status==='progress' && p.total){ dlFiles[f]={l:p.loaded,t:p.total};
+      const tot=Object.values(dlFiles).reduce((a,x)=>a+x.t,0), got=Object.values(dlFiles).reduce((a,x)=>a+x.l,0);
+      asrUI(5+got/tot*25,'Скачиваю модель: '+(got/1048576).toFixed(0)+' из '+(tot/1048576).toFixed(0)+' МБ'); }
+    return; }
+  if(m.type==='ready') asrLog('модель готова');
+  if(wPending){ const r=wPending; wPending=null; m.type==='err'? r.rej(new Error(m.msg)) : r.res(m); }
+}
+function startWorker(){
+  return new Promise(res=>{
+    let ok=false, fin=v=>{ if(ok===null) return; const was=ok; ok=null; if(!was) res(v); };
+    try{ worker=new Worker(URL.createObjectURL(new Blob([WORKER_SRC],{type:'text/javascript'})),{type:'module'}); }
+    catch(e){ asrLog('фоновый поток не создаётся: '+e.message); return res(false); }
+    worker.onmessage=e=>{ if(ok===false){ ok=true; res(true); } onEngineMsg(e.data); };
+    worker.onerror=e=>{ asrLog('ошибка фонового потока: '+(e.message||'без описания'));
+      if(ok===false){ fin(false); } else if(wPending){ const r=wPending; wPending=null; r.rej(new Error(e.message||'фоновый поток упал')); } };
+    setTimeout(()=>{ if(ok===false){ asrLog('фоновый поток не ответил за 8 с'); fin(false); } },8000);
+  });
+}
+function useMainThread(){
+  if(worker){ try{ worker.terminate(); }catch(e){} worker=null; }
+  const h=(new Function(ENGINE_CORE+'\nreturn handle;'))();
+  engine={kind:'main',post:m=>setTimeout(()=>h(m,onEngineMsg),0)};
+  asrLog('режим: основной поток (страница может подтормаживать)');
+}
+async function ensureEngine(){
+  if(engine) return;
+  if(await startWorker()){ const w=worker; engine={kind:'worker',post:(m,t)=>w.postMessage(m,t||[])}; asrLog('режим: фоновый поток'); }
+  else useMainThread();
+}
+function wCall(msg,transfer){ return new Promise((res,rej)=>{ wPending={res,rej}; engine.post(msg,transfer); }); }
 function asrUI(pct,txt){ $('#asrProg').hidden=false; $('#asrBar').style.width=clamp(pct,0,100)+'%'; $('#asrStatus').textContent=txt; }
 
 async function decodeAudio(file){
@@ -774,20 +810,27 @@ $('#asrGo').onclick=async()=>{
     device='webgpu'; let f16=false; try{ const ad=await navigator.gpu.requestAdapter(); f16=ad&&ad.features.has('shader-f16'); }catch(e){}
     dtype={encoder_model:f16?'fp16':'fp32', decoder_model_merged:'q4'};
   } else if(hasGPU){ device='webgpu'; dtype={encoder_model:'fp32',decoder_model_merged:'q4'}; }
-  st.busy=true; $('#asrGo').disabled=true; $('#go').disabled=true; dlFiles={};
-  lastBeat=Date.now(); let stage='';
+  st.busy=true; $('#asrGo').disabled=true; $('#go').disabled=true; dlFiles={}; dlSeen={};
+  asrT0=Date.now(); lastBeat=Date.now(); $('#asrLog').innerHTML=''; let stage='';
   const dog=setInterval(()=>{
     if(stage!=='load') return;
-    const quiet=(Date.now()-lastBeat)/1000;
-    if(quiet>40) $('#asrStatus').textContent='Загрузка не идёт уже '+Math.round(quiet)+' с. Похоже, сервер модели недоступен из вашей сети: включите VPN и нажмите «Распознать речь» ещё раз. VPN нужен только для первого скачивания.';
-  },2000);
+    const quiet=Math.round((Date.now()-lastBeat)/1000);
+    if(quiet>=5) $('#asrStatus').textContent='Жду: '+lastStep+' · нет новостей '+quiet+' с'+(quiet>=90?'. Если так и стоит, пришлите скриншот списка ниже.':'');
+  },1000);
   try{
     asrUI(1,'Извлекаю звук из видео…');
     const audio=await decodeAudio(st.file);
     if(!st.env) envFrom(audio);
-    asrUI(3,'Загружаю библиотеку распознавания…'); stage='load'; lastBeat=Date.now();
+    asrLog('звук извлечён: '+fmtT(audio.length/16000,false));
+    asrUI(3,'Загружаю распознавание…'); stage='load'; lastBeat=Date.now();
+    await ensureEngine();
     try{ await wCall({type:'load',model:M.id,device,dtype}); }
-    catch(e){ if(device==='webgpu' && !M.gpu){ device='wasm'; dtype='q8'; await wCall({type:'load',model:M.id,device,dtype}); } else throw e; }
+    catch(e){
+      asrLog('ошибка: '+e.message);
+      if(device==='webgpu' && !M.gpu){ device='wasm'; dtype='q8'; asrLog('пробую без видеокарты'); await wCall({type:'load',model:M.id,device,dtype}); }
+      else if(engine.kind==='worker'){ asrLog('пробую без фонового потока'); useMainThread(); await wCall({type:'load',model:M.id,device,dtype}); }
+      else throw e;
+    }
     stage='run';
     const wins=splitWindows(audio,16000); let words=[], wordLevel=true; const t0=performance.now();
     for(let i=0;i<wins.length;i++){
@@ -807,7 +850,8 @@ $('#asrGo').onclick=async()=>{
     }
   }catch(e){
     console.error(e); logErr('Распознавание: '+(e.message||e));
-    asrUI(0,'Не получилось: '+(e.message||e)+'. Проверьте интернет (модель скачивается при первом запуске) или выберите «Быструю» модель.');
+    asrLog('остановлено: '+(e.message||e));
+    asrUI(0,'Не получилось: '+(e.message||e)+'. Пришлите скриншот списка шагов ниже.');
   }
   clearInterval(dog); memRefresh();
   st.busy=false; $('#asrGo').disabled=false; refresh();
@@ -1188,7 +1232,7 @@ function twoTap(btn,fn){
     await fn(); memRefresh();
   };
 }
-function stopWorker(){ if(worker){ try{ worker.terminate(); }catch(e){} worker=null; wPending=null; } }
+function stopWorker(){ if(worker){ try{ worker.terminate(); }catch(e){} } worker=null; wPending=null; engine=null; }
 twoTap($('#clrHist'),async()=>{
   if(st.busy){ toast('Дождитесь окончания нарезки или распознавания.'); return; }
   st.results.forEach(r=>URL.revokeObjectURL(r.url)); st.results=[]; $('#results').innerHTML=''; $('#resPanel').hidden=true;
@@ -1206,7 +1250,7 @@ twoTap($('#clrModel'),async()=>{
 $('#memRe').onclick=memRefresh;
 
 /* ================= diagnostics ================= */
-const APP_VERSION='8 · 20.10.2026';
+const APP_VERSION='9 · 20.10.2026';
 const errLog=[];
 function logErr(m){ errLog.push(new Date().toTimeString().slice(0,8)+' '+m); if(errLog.length>8) errLog.shift(); }
 addEventListener('error',e=>logErr('Ошибка: '+(e.message||e.type)));
